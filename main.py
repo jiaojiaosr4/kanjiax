@@ -1,10 +1,10 @@
 # main.py
 # 砍价侠基础版 - 入口
 #
-# 两种运行模式：
-#   python main.py                  -> 示例数据模式（离线，演示决策引擎）
-#   python main.py --tbk "耳机"      -> 联盟 API 模式（真实淘宝商品搜索 + 推荐）
-#                                     需配置 config.json 或环境变量 TBK_APP_KEY 等
+# 三种运行模式：
+#   python main.py                        -> 示例数据模式（离线，演示决策引擎）
+#   python main.py --item "商品ID或链接"   -> 商品详情模式（真实数据，已可用）
+#   python main.py --tbk "耳机"           -> 联盟搜索模式（需权限包27939审核通过）
 
 import argparse
 import html
@@ -308,13 +308,117 @@ def run_tbk_mode(keyword):
         print(f"  {i}. {p['name'][:30]} | 券后¥{p['coupon_price']} | 划算分 {p['worth_score']}")
 
 
+def run_item_mode(num_iid):
+    """商品详情模式：按淘宝商品 ID 拉真实数据（关键词搜索权限审核期间可用）。"""
+    from adapter import TbkAdapter
+
+    adapter = TbkAdapter.from_config()
+    if not adapter.configured():
+        print("未配置淘宝联盟凭证。请先填写 config.json。")
+        return
+
+    # 支持传入完整淘宝商品链接，自动提取 ID
+    raw = str(num_iid)
+    if "uland.taobao.com" in raw:
+        import re
+        m = re.search(r"[?&]id=([^&]+)", raw)
+        if m:
+            num_iid = m.group(1)
+        else:
+            print(f"无法从 uland 链接中提取商品 ID：{raw}")
+            return
+    elif "item.taobao.com" in raw or "detail.tmall" in raw:
+        import re
+        m = re.search(r"[?&]id=(\d+)", raw)
+        if m:
+            num_iid = m.group(1)
+        else:
+            print(f"无法从链接中提取商品 ID：{raw}")
+            return
+
+    print(f"调用淘宝联盟商品详情 API（num_iid={num_iid}）...")
+    try:
+        products = adapter.item_info(num_iid)
+    except Exception as e:
+        print(f"API 调用失败：{e}")
+        return
+
+    if not products:
+        print("未查到商品。可能该商品未参加淘宝客推广（联盟 API 只返回有佣金的商品）。")
+        print("换个热门商品试试，或从淘宝客商品页复制 ID。")
+        return
+
+    p = products[0]
+    discount = 0
+    if p["price"] > 0:
+        discount = round((1 - p["coupon_price"] / p["price"]) * 100)
+
+    # 基础决策：根据折扣力度给买/等/换
+    if discount >= 30:
+        action, reason = "买", f"折扣力度 {discount}%，属于大促级别，建议入手"
+    elif discount >= 15:
+        action, reason = "买", f"折扣 {discount}%，价格合理，可以入手"
+    elif discount > 0:
+        action, reason = "等", f"折扣仅 {discount}%，非低位，建议等大促或找替代品"
+    else:
+        action, reason = "等", "无折扣信息，建议等待或比价"
+
+    color = ACTION_COLOR.get(action, C_MUTED)
+
+    card = f'''
+    <div style="background:#fff;border:1px solid {C_BORDER};border-radius:14px;padding:24px;margin-bottom:20px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <div>
+          <div style="font-size:18px;font-weight:600;color:{C_TEXT}">{html.escape(p["name"])}</div>
+          <div style="font-size:12px;color:{C_MUTED};margin-top:2px">淘宝 · {html.escape(p.get("nick",""))}</div>
+        </div>
+        <div style="background:{color};color:#fff;padding:10px 22px;border-radius:10px;font-size:22px;font-weight:600">{action}</div>
+      </div>
+      <div style="background:{C_LIGHT};border-left:4px solid {color};padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;color:{C_TEXT};line-height:1.6">
+        {reason}
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+        <div>
+          <div style="font-size:13px;font-weight:600;color:{C_PRIMARY};margin-bottom:8px">真实价格（联盟 API）</div>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;color:{C_TEXT}">
+            <tr><td style="padding:8px 12px;border-bottom:1px solid {C_BORDER};color:{C_MUTED}">原价</td><td style="padding:8px 12px;border-bottom:1px solid {C_BORDER}"><span style="text-decoration:line-through;color:{C_MUTED}">¥{p["price"]}</span></td></tr>
+            <tr><td style="padding:8px 12px;border-bottom:1px solid {C_BORDER};color:{C_MUTED}">到手价</td><td style="padding:8px 12px;border-bottom:1px solid {C_BORDER};color:{C_PRIMARY};font-weight:600;font-size:16px">¥{p["coupon_price"]}</td></tr>
+            <tr><td style="padding:8px 12px;border-bottom:1px solid {C_BORDER};color:{C_MUTED}">折扣</td><td style="padding:8px 12px;border-bottom:1px solid {C_BORDER};color:{C_CORAL}">{discount}%</td></tr>
+            <tr><td style="padding:8px 12px;color:{C_MUTED}">销量</td><td style="padding:8px 12px">{p["volume"]}</td></tr>
+          </table>
+        </div>
+        <div>
+          {f'<img src="{p["pict_url"]}" style="width:100%;border-radius:8px;border:1px solid {C_BORDER}" />' if p.get("pict_url") else '<div style="background:#F6F7F5;border-radius:8px;height:120px;display:flex;align-items:center;justify-content:center;color:#999;font-size:12px">无主图</div>'}
+          <div style="margin-top:8px;text-align:center">
+            <a href="{p.get("url","")}" style="font-size:12px;color:{C_PRIMARY}" target="_blank">查看淘宝商品页 →</a>
+          </div>
+        </div>
+      </div>
+    </div>
+    '''
+
+    html_doc = render_html(card, f"砍价侠 · 商品详情（真实数据）")
+    with open("report.html", "w", encoding="utf-8") as f:
+        f.write(html_doc)
+
+    print("=" * 50)
+    print("商品详情模式 · 报告已生成 -> report.html")
+    print("=" * 50)
+    print(f"\n商品：{p['name'][:40]}")
+    print(f"原价 ¥{p['price']} → 到手价 ¥{p['coupon_price']}（折扣 {discount}%）")
+    print(f"决策：【{action}】{reason}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="砍价侠 - AI 购物决策引擎")
-    parser.add_argument("--tbk", metavar="关键词", help="使用淘宝联盟 API 搜索真实商品（需配置凭证）")
+    parser.add_argument("--tbk", metavar="关键词", help="使用淘宝联盟 API 搜索真实商品（需配置凭证+物料搜索权限）")
+    parser.add_argument("--item", metavar="商品ID或链接", help="按淘宝商品 ID/链接拉真实详情（需配置凭证，已可用）")
     args = parser.parse_args()
 
     if args.tbk:
         run_tbk_mode(args.tbk)
+    elif args.item:
+        run_item_mode(args.item)
     else:
         run_sample_mode()
 

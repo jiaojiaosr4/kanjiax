@@ -26,7 +26,7 @@ class TbkAdapter:
       TBK_ADZONE_ID   推广位 ID（PID 末段，如 mm_xxx_xxx_123 中的 123）
     """
 
-    GATEWAY = "https://eco.taobao.com/router/rest"
+    GATEWAY = "https://gw.api.taobao.com/router/rest"
 
     def __init__(self, app_key=None, app_secret=None, adzone_id=None):
         self.app_key = app_key
@@ -86,7 +86,9 @@ class TbkAdapter:
     def search(self, keyword, page_size=20):
         """关键词搜索淘宝商品，返回真实价格、券后价、佣金、销量。
 
-        接口：taobao.tbk.dg.material.optional（物料搜索）
+        接口：taobao.tbk.dg.material.optional.upgrade（物料搜索升级版）
+        旧版 taobao.tbk.dg.material.optional 已于 2024-01 下线，
+        升级版需权限包「淘宝客【推广者】商品物料获取」。
         """
         if not self.configured():
             raise RuntimeError("淘宝联盟未配置，请设置 TBK_APP_KEY / TBK_APP_SECRET / TBK_ADZONE_ID")
@@ -98,13 +100,14 @@ class TbkAdapter:
             "platform": "2",  # 无线端
             "page_no": 1,
         }
-        data = self._call("taobao.tbk.dg.material.optional", biz)
+        data = self._call("taobao.tbk.dg.material.optional.upgrade", biz)
 
-        # 解析返回（淘宝返回结构层级较深，做兼容处理）
-        resp_key = "tbk_dg_optimus_material_response"
+        # 解析返回（升级版响应 key 与旧版不同）
+        resp_key = "tbk_dg_material_optional_upgrade_response"
         resp = data.get(resp_key, {})
         if "error_response" in data:
-            raise RuntimeError(f"联盟 API 返回错误：{data.get('error_response', {}).get('sub_msg', data)}")
+            er = data["error_response"]
+            raise RuntimeError(f"联盟 API 返回错误：code={er.get('code')} {er.get('sub_code','')} {er.get('sub_msg','')}")
 
         result = resp.get("result_list_map", resp.get("result_list", {}))
         items = result.get("map_data", [])
@@ -124,6 +127,69 @@ class TbkAdapter:
                 "volume": int(it.get("volume", 0) or 0),
                 "url": it.get("click_url", ""),
                 "pict_url": it.get("pict_url", ""),
+            })
+        return products
+
+    def item_info(self, item_id):
+        """按商品 ID 查询真实商品详情（价格、标题、主图、佣金、促销）。
+
+        接口：taobao.tbk.item.info.upgrade.get（商品详情升级版）
+        权限包：淘宝客【公用】物料信息查询（已开通，升级版自动可用）
+        支持新版动态字符串 ID（如 uland 链接中的 id 参数）。
+        """
+        if not self.configured():
+            raise RuntimeError("淘宝联盟未配置，请设置 TBK_APP_KEY / TBK_APP_SECRET / TBK_ADZONE_ID")
+
+        if isinstance(item_id, (list, tuple)):
+            item_id = ",".join(str(n) for n in item_id)
+
+        biz = {
+            "item_id": str(item_id),
+            "platform": "2",
+        }
+        data = self._call("taobao.tbk.item.info.upgrade.get", biz)
+
+        if "error_response" in data:
+            er = data["error_response"]
+            raise RuntimeError(f"联盟 API 返回错误：code={er.get('code')} {er.get('sub_code','')} {er.get('sub_msg','')}")
+
+        resp = data.get("tbk_item_info_upgrade_get_response", {})
+        details = resp.get("results", {}).get("tbk_item_detail", [])
+        if isinstance(details, dict):
+            details = [details]
+
+        products = []
+        for d in details:
+            basic = d.get("item_basic_info", {})
+            price_info = d.get("price_promotion_info", {})
+            pub = d.get("publish_info", {})
+            title = (basic.get("title") or "").replace("<em>", "").replace("</em>", "")
+            # 到手价优先取 final_promotion_price（含券），否则取 zk_final_price
+            final_price = float(price_info.get("final_promotion_price", 0) or 0)
+            zk_price = float(price_info.get("zk_final_price", 0) or 0)
+            reserve = float(price_info.get("reserve_price", 0) or 0)
+            coupon_price = final_price if final_price > 0 else zk_price
+            # 佣金率：联盟返回 "300" 表示 3.00%
+            commission_rate = float(pub.get("income_info", {}).get("commission_rate", 0) or 0) / 100
+
+            # 促销信息
+            promos = price_info.get("final_promotion_path_list", {}).get("final_promotion_path_map_data", [])
+            promo_descs = [p.get("promotion_desc", "") for p in promos if p.get("promotion_desc")]
+
+            products.append({
+                "id": str(d.get("item_id", "")),
+                "name": title.strip(),
+                "platform": "淘宝",
+                "price": reserve,
+                "coupon_price": coupon_price,
+                "commission_rate": commission_rate,
+                "volume": int(pub.get("daily_promotion_sales", 0) or 0),
+                "url": basic.get("item_url", ""),
+                "pict_url": basic.get("pict_url", ""),
+                "nick": basic.get("shop_title", ""),
+                "brand": basic.get("brand_name", ""),
+                "category": basic.get("category_name", ""),
+                "promotions": promo_descs,
             })
         return products
 
