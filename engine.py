@@ -189,3 +189,78 @@ def analyze_product(product):
         "review_analysis": review_analysis,
         "decision": decision,
     }
+
+
+# ============================================================
+# 搜索结果分析（联盟 API 模式）
+# 对关键词搜索返回的多个真实商品做排序与推荐
+# ============================================================
+def analyze_search_results(keyword, products):
+    """对联盟搜索返回的真实商品列表做划算度排序与推荐。
+
+    联盟 API 不提供评论与历史价格，故此模式下决策基于：
+      - 券后折扣力度（coupon_price vs price）
+      - 销量（市场验证度）
+      - 佣金率（平台认可度）
+    评论去水与历史价高位判断需接入补充数据源（路线图）。
+    """
+    if not products:
+        return {"keyword": keyword, "total": 0, "ranked": [], "top_pick": None}
+
+    ranked = []
+    for p in products:
+        price = p.get("price", 0)
+        coupon = p.get("coupon_price", 0)
+        volume = p.get("volume", 0)
+        comm = p.get("commission_rate", 0)
+
+        # 券后折扣力度（百分比）
+        discount_pct = round(((price - coupon) / price) * 100, 1) if price else 0
+        # 销量归一（封顶 10000）
+        volume_score = min(volume, 10000) / 100
+        # 佣金贡献（封顶 20%）
+        comm_score = min(comm, 20) * 2
+
+        # 划算分：折扣 40% + 销量 40% + 佣金 20%
+        worth_score = round(discount_pct * 0.4 + volume_score * 0.4 + comm_score * 0.2, 1)
+
+        ranked.append({
+            "id": p.get("id"),
+            "name": p.get("name", "")[:60],
+            "platform": p.get("platform", "淘宝"),
+            "price": price,
+            "coupon_price": coupon,
+            "discount_pct": discount_pct,
+            "volume": volume,
+            "commission_rate": comm,
+            "worth_score": worth_score,
+            "url": p.get("url", ""),
+        })
+
+    # 按划算分降序
+    ranked.sort(key=lambda x: x["worth_score"], reverse=True)
+    top = ranked[0] if ranked else None
+
+    # 推荐理由
+    recommendation = None
+    if top:
+        reason_parts = []
+        if top["discount_pct"] > 0:
+            reason_parts.append(f"券后 ¥{top['coupon_price']}（省 {top['discount_pct']}%）")
+        if top["volume"] > 0:
+            reason_parts.append(f"销量 {top['volume']}")
+        if top["commission_rate"] > 0:
+            reason_parts.append(f"佣金 {top['commission_rate']}%")
+        recommendation = {
+            "name": top["name"],
+            "headline": f"「{keyword}」推荐：{top['name'][:30]}，" + "，".join(reason_parts),
+            "worth_score": top["worth_score"],
+        }
+
+    return {
+        "keyword": keyword,
+        "total": len(ranked),
+        "ranked": ranked,
+        "top_pick": top,
+        "recommendation": recommendation,
+    }

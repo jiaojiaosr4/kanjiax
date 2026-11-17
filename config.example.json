@@ -1,0 +1,9 @@
+{
+  "_说明": "淘宝联盟 API 配置。复制本文件为 config.json 并填入你的凭证。申请地址：pub.alimama.com",
+  "_申请步骤": "1.阿里妈妈注册账号并实名 → 2.媒体备案（导购媒体类型）→ 3.创建应用拿 AppKey/AppSecret → 4.获取推广位 PID（mm_账号_媒体_推广位），adzone_id 即末段数字",
+  "tbk": {
+    "app_key": "在此填入 AppKey",
+    "app_secret": "在此填入 AppSecret",
+    "adzone_id": "在此填入推广位 ID（PID 末段数字）"
+  }
+}
