@@ -1,10 +1,11 @@
 # main.py
 # 砍价侠基础版 - 入口
 #
-# 三种运行模式：
+# 四种运行模式：
 #   python main.py                        -> 示例数据模式（离线，演示决策引擎）
-#   python main.py --item "商品ID或链接"   -> 商品详情模式（真实数据，已可用）
-#   python main.py --tbk "耳机"           -> 联盟搜索模式（需权限包27939审核通过）
+#   python main.py --item "商品ID或链接"   -> 淘宝商品详情模式（真实数据，已可用）
+#   python main.py --tbk "耳机"           -> 淘宝联盟搜索模式（27939 权限已通过）
+#   python main.py --jd [频道号]            -> 京东京粉精选真实商品决策（基础权限包，默认频道1）
 
 import argparse
 import html
@@ -217,7 +218,7 @@ def render_search_report(result):
     '''
 
 
-def render_html(body, title):
+def render_html(body, title, source="淘宝联盟官方 API"):
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -240,7 +241,7 @@ def render_html(body, title):
   </div>
   {body}
   <div class="footer">
-    砍价侠基础版 · 真实数据来自淘宝联盟官方 API（配置后）/ 内置示例数据（默认）<br/>
+    砍价侠基础版 · 真实数据来自{source}（配置后）/ 内置示例数据（默认）<br/>
     评论去水采用可解释规则 · 历史价格库与评论数据源为路线图项
   </div>
 </div>
@@ -409,16 +410,183 @@ def run_item_mode(num_iid):
     print(f"决策：【{action}】{reason}")
 
 
+def run_jd_mode(elite):
+    """京东模式：京粉精选真实商品 -> 划算分排序 -> 买/等/换 + 证据链。
+
+    权限边界（如实标注，不含虚构数据）：个人「导购媒体」仅基础权限包，
+    实测只有京粉精选可用；关键词搜索 / 按 SKU 查详情 / 转链拿佣金
+    需网站/APP 资质或更高等级（月 3 万单），当前账号拿不到。
+    """
+    from jd_adapter import JdAdapter
+    from engine import analyze_search_results
+
+    adapter = JdAdapter.from_config()
+    if not adapter.configured():
+        print("未配置京东联盟凭证。请先填写 config.json 的 jd 段（JD_APP_KEY / JD_APP_SECRET）。")
+        return
+
+    elite_id = 1
+    if elite and str(elite).strip().isdigit():
+        elite_id = int(str(elite).strip())
+
+    print(f"调用京东联盟京粉精选 API（频道 eliteId={elite_id}）...")
+    try:
+        products = adapter.jingfen_select(elite_id=elite_id, page_size=20)
+    except Exception as e:
+        print(f"API 调用失败：{e}")
+        return
+
+    if not products:
+        print("该频道暂无商品，换一个频道号试试（如 --jd 2）。")
+        return
+
+    print(f"获取到 {len(products)} 个真实京东商品，开始分析...")
+    label = f"京东京粉精选 · 频道 {elite_id}"
+    result = analyze_search_results(label, products)
+    ranked = result["ranked"]
+    orig = {str(p["id"]): p for p in products}
+
+    # ===== 决策（可解释规则，全部基于真实字段）=====
+    top = ranked[0]
+    tp = orig.get(str(top["id"]), {})
+    discount = top["discount_pct"]
+    good = tp.get("good_rate", 0)
+    orders = top["volume"]
+    cheaper = [r for r in ranked[1:] if r["coupon_price"] < top["coupon_price"]]
+
+    if discount >= 40 and good >= 95:
+        action, color = "买", ACTION_COLOR["买"]
+        reason = (f"券后 ¥{top['coupon_price']}，比标价省 {discount}%；好评率 {good:g}%、"
+                  f"近 30 天 {orders} 单验证充分，属于破价好券，可入手")
+    elif discount >= 15:
+        action, color = "等", ACTION_COLOR["等"]
+        reason = (f"券后省 {discount}%，力度中等（非破价位）；"
+                  f"建议等大促或与淘宝同款比价后再定")
+    else:
+        action, color = "换", ACTION_COLOR["换"]
+        alt = f"，本批有 {len(cheaper)} 款到手价更低" if cheaper else ""
+        reason = (f"券后仅省 {discount}%，优惠偏弱{alt}；建议换同批里折扣更狠的真实款")
+
+    # ===== 证据链（真实字段，不编历史价 / 评论内容）=====
+    evidence = []
+    if tp.get("coupon_discount", 0) > 0:
+        q = tp.get("coupon_quota", 0)
+        if q > 0:
+            evidence.append(f"优惠券：满 {q:g} 减 {tp['coupon_discount']:g} 元（联盟接口真实券）")
+        else:
+            evidence.append(f"优惠券：减 {tp['coupon_discount']:g} 元（联盟接口真实券）")
+    evidence.append(f"价格：标价 ¥{top['price']} → 券后到手 ¥{top['coupon_price']}（省 {discount}%）")
+    word_of_mouth = f"{tp.get('comments', 0)} 条评论，好评率 {good:g}%"
+    if tp.get("shop_score"):
+        word_of_mouth += f"，店铺评分 {tp['shop_score']}"
+    evidence.append("口碑：" + word_of_mouth)
+    evidence.append(f"市场验证：近 30 天订单 {orders} 单；佣金率 {top['commission_rate']}%（平台认可度）")
+    tags = tp.get("tags", [])
+    if tags:
+        evidence.append("商品标签：" + "、".join(tags[:4]) + "（接口原生标签）")
+    if cheaper:
+        c = cheaper[0]
+        evidence.append(f"同类横向比价：本批还有到手价更低的「{c['name'][:20]}」¥{c['coupon_price']}，可作换的候选")
+    evidence.append("划算分 = 券后折扣(40%) + 订单量(40%) + 佣金率(20%)，按真实字段计算")
+
+    # ===== 渲染 =====
+    rows = ""
+    for i, r in enumerate(ranked[:15], 1):
+        o = orig.get(str(r["id"]), {})
+        is_top = i == 1
+        bg = C_LIGHT if is_top else "#fff"
+        gr = o.get("good_rate", 0)
+        rows += (
+            f'<tr style="background:{bg}">'
+            f'<td style="padding:8px 10px;border-bottom:1px solid {C_BORDER};font-weight:{600 if is_top else 400}">{i}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid {C_BORDER};max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{html.escape(r["name"])}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid {C_BORDER}">¥{r["price"]}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid {C_BORDER};color:{C_PRIMARY};font-weight:600">¥{r["coupon_price"]}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid {C_BORDER};color:{C_CORAL}">{r["discount_pct"]}%</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid {C_BORDER}">{r["commission_rate"]}%</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid {C_BORDER}">{r["volume"]}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid {C_BORDER}">{gr:g}%</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid {C_BORDER};font-weight:600;color:{C_PRIMARY}">{r["worth_score"]}</td>'
+            f'</tr>'
+        )
+
+    ev_html = "".join(f'<li style="margin-bottom:6px;color:{C_TEXT};line-height:1.6">{html.escape(e)}</li>' for e in evidence)
+    top_pict = tp.get("pict_url", "")
+    pict_html = (f'<img src="{top_pict}" style="width:120px;height:120px;object-fit:contain;border-radius:8px;border:1px solid {C_BORDER}" />'
+                 if top_pict else "")
+
+    card = f'''
+    <div style="background:{C_PRIMARY};color:#fff;padding:18px 22px;border-radius:12px;margin-bottom:20px">
+      <div style="font-size:13px;opacity:0.85;margin-bottom:6px">最划算 · 划算分 {top['worth_score']} · 频道「{html.escape(tp.get('elite_name', label))}」</div>
+      <div style="font-size:16px;font-weight:600;line-height:1.6">{html.escape(top['name'][:40])}</div>
+    </div>
+    <div style="background:#fff;border:1px solid {C_BORDER};border-radius:14px;padding:22px;margin-bottom:20px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div style="font-size:16px;font-weight:600;color:{C_TEXT}">{html.escape(top['name'][:34])}</div>
+        <div style="background:{color};color:#fff;padding:9px 22px;border-radius:10px;font-size:22px;font-weight:600">{action}</div>
+      </div>
+      <div style="background:{C_LIGHT};border-left:4px solid {color};padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;color:{C_TEXT};line-height:1.7">
+        {html.escape(reason)}
+      </div>
+      <div style="display:flex;gap:18px;align-items:flex-start">
+        {pict_html}
+        <div style="flex:1">
+          <div style="font-size:13px;font-weight:600;color:{C_PRIMARY};margin-bottom:8px">证据链（全部来自京东联盟接口真实字段）</div>
+          <ul style="margin:0;padding-left:18px;font-size:12.5px">{ev_html}</ul>
+        </div>
+      </div>
+    </div>
+    <div style="background:#fff;border:1px solid {C_BORDER};border-radius:14px;padding:20px;margin-bottom:20px">
+      <div style="font-size:15px;font-weight:600;color:{C_TEXT};margin-bottom:14px">
+        {html.escape(label)} · 共 {result['total']} 个真实商品 · 按划算度排序
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12.5px;color:{C_TEXT}">
+        <thead><tr style="background:#F6F7F5;color:{C_MUTED}">
+          <th style="padding:8px 10px;text-align:left;border-bottom:1px solid {C_BORDER}">#</th>
+          <th style="padding:8px 10px;text-align:left;border-bottom:1px solid {C_BORDER}">商品</th>
+          <th style="padding:8px 10px;text-align:left;border-bottom:1px solid {C_BORDER}">标价</th>
+          <th style="padding:8px 10px;text-align:left;border-bottom:1px solid {C_BORDER}">券后</th>
+          <th style="padding:8px 10px;text-align:left;border-bottom:1px solid {C_BORDER}">折扣</th>
+          <th style="padding:8px 10px;text-align:left;border-bottom:1px solid {C_BORDER}">佣金</th>
+          <th style="padding:8px 10px;text-align:left;border-bottom:1px solid {C_BORDER}">30天单</th>
+          <th style="padding:8px 10px;text-align:left;border-bottom:1px solid {C_BORDER}">好评</th>
+          <th style="padding:8px 10px;border-bottom:1px solid {C_BORDER}">划算分</th>
+        </tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <div style="font-size:11.5px;color:{C_MUTED};margin-top:14px;line-height:1.7">
+        数据来源：京东联盟官方 API（jd.union.open.goods.jingfen.query 京粉精选）· 真实价格 / 券 / 佣金 / 订单 / 好评<br/>
+        权限边界：个人导购媒体基础权限包仅京粉精选可用；关键词搜索、按 SKU 查详情、转链需网站/APP 资质或更高等级。<br/>
+        历史价位、评论去水数据源待接入（本页不含任何虚构数字）。
+      </div>
+    </div>
+    '''
+
+    html_doc = render_html(card, "砍价侠 · 京东京粉精选决策报告（真实数据）", source="京东联盟官方 API（京粉精选）")
+    with open("report.html", "w", encoding="utf-8") as f:
+        f.write(html_doc)
+
+    print("=" * 50)
+    print("京东模式 · 报告已生成 -> report.html")
+    print("=" * 50)
+    print(f"\n商品：{top['name'][:40]}")
+    print(f"标价 ¥{top['price']} → 券后 ¥{top['coupon_price']}（省 {discount}%）")
+    print(f"决策：【{action}】{reason}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="砍价侠 - AI 购物决策引擎")
-    parser.add_argument("--tbk", metavar="关键词", help="使用淘宝联盟 API 搜索真实商品（需配置凭证+物料搜索权限）")
-    parser.add_argument("--item", metavar="商品ID或链接", help="按淘宝商品 ID/链接拉真实详情（需配置凭证，已可用）")
+    parser.add_argument("--tbk", metavar="关键词", help="使用淘宝联盟 API 搜索真实商品（27939 权限已通过）")
+    parser.add_argument("--item", metavar="商品ID或链接", help="按淘宝商品 ID/链接拉真实详情（已可用）")
+    parser.add_argument("--jd", nargs="?", const="1", metavar="频道号", help="京东京粉精选真实商品决策（默认频道1，可指定 --jd 2，需配置 jd 凭证）")
     args = parser.parse_args()
 
     if args.tbk:
         run_tbk_mode(args.tbk)
     elif args.item:
         run_item_mode(args.item)
+    elif args.jd:
+        run_jd_mode(args.jd)
     else:
         run_sample_mode()
 
