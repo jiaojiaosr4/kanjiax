@@ -102,31 +102,50 @@ class TbkAdapter:
         }
         data = self._call("taobao.tbk.dg.material.optional.upgrade", biz)
 
-        # 解析返回（升级版响应 key 与旧版不同）
-        resp_key = "tbk_dg_material_optional_upgrade_response"
-        resp = data.get(resp_key, {})
         if "error_response" in data:
             er = data["error_response"]
             raise RuntimeError(f"联盟 API 返回错误：code={er.get('code')} {er.get('sub_code','')} {er.get('sub_msg','')}")
 
-        result = resp.get("result_list_map", resp.get("result_list", {}))
-        items = result.get("map_data", [])
+        # 升级版返回嵌套结构，字段分布在 item_basic_info / price_promotion_info / publish_info
+        resp = data.get("tbk_dg_material_optional_upgrade_response", {})
+        items = resp.get("result_list", {}).get("map_data", [])
         if isinstance(items, dict):
             items = [items]
 
         products = []
         for it in items[:page_size]:
-            title = (it.get("title") or "").replace("<em>", "").replace("</em>", "")
+            basic = it.get("item_basic_info", {})
+            price_info = it.get("price_promotion_info", {})
+            pub = it.get("publish_info", {})
+            title = (basic.get("title") or "").replace("<em>", "").replace("</em>", "")
+            # 到手价优先取 final_promotion_price（含券），否则取 zk_final_price
+            final_price = float(price_info.get("final_promotion_price", 0) or 0)
+            zk_price = float(price_info.get("zk_final_price", 0) or 0)
+            reserve = float(price_info.get("reserve_price", 0) or 0)
+            coupon_price = final_price if final_price > 0 else zk_price
+            # 佣金率：联盟返回 "300" 表示 3.00%
+            commission_rate = float(pub.get("income_info", {}).get("commission_rate", 0) or 0) / 100
+            # 推广链接可能是 // 开头，补全协议
+            click_url = pub.get("click_url", "") or ""
+            if click_url.startswith("//"):
+                click_url = "https:" + click_url
+            promos = price_info.get("final_promotion_path_list", {}).get("final_promotion_path_map_data", [])
+            promo_descs = [p.get("promotion_desc", "") for p in promos if p.get("promotion_desc")]
+
             products.append({
                 "id": str(it.get("item_id", "")),
                 "name": title.strip(),
                 "platform": "淘宝",
-                "price": float(it.get("reserve_price", 0) or 0),
-                "coupon_price": float(it.get("zk_final_price", 0) or 0),
-                "commission_rate": float(it.get("commission_rate", 0) or 0) / 100,
-                "volume": int(it.get("volume", 0) or 0),
-                "url": it.get("click_url", ""),
-                "pict_url": it.get("pict_url", ""),
+                "price": reserve,
+                "coupon_price": coupon_price,
+                "commission_rate": commission_rate,
+                "volume": int(pub.get("daily_promotion_sales", 0) or 0),
+                "url": click_url,
+                "pict_url": basic.get("pict_url", ""),
+                "nick": basic.get("shop_title", ""),
+                "brand": basic.get("brand_name", ""),
+                "category": basic.get("category_name", ""),
+                "promotions": promo_descs,
             })
         return products
 
