@@ -187,47 +187,43 @@ KWS.forEach(k=>{
 });
 
 // ---- 可解释决策引擎（全部基于真实字段，不编数据）----
-function metrics(p){
-  const price=p.price||0, cp=p.coupon_price||0;
-  const disc = price>0 ? (price-cp)/price*100 : 0;          // 折扣力度%
-  const volS = Math.min((p.volume||0)/50,1)*100;             // 日销验证分(50件封顶)
-  const commS= Math.min((p.commission_rate||0)/2,1)*100;     // 佣金认可分(2%封顶)
-  const score= Math.round((disc*0.5 + volS*0.3 + commS*0.2)*10)/10; // 划算分
-  return {disc:Math.round(disc*10)/10, volS, commS, score};
+function readNumber(value){
+  if(value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : null;
 }
-function decide(p, m, ranked){
-  // 优先级1：虚标原价（大折扣+高原价）→ 换
-  if(m.disc>=80 && p.price>=500){
-    return {act:"swap", tag:"原价虚高",
-      why:"标价 "+yuan(p.price)+" 却打到 "+m.disc+"% off，属常见「先提价再打折」营销锚定，且同类有更实在的款"};
+function roundScore(value){ return Math.floor(value * 10 + 0.5) / 10; }
+function metrics(p){
+  const price = readNumber(p.price), checkout = readNumber(p.coupon_price);
+  if(!price || !checkout) return null;
+  const disc = roundScore(Math.max(0, 100 * (price - checkout) / price));
+  const volS = Math.min((readNumber(p.volume) || 0) / 50, 1) * 100;
+  return {disc, volS, score: roundScore(disc * 0.6 + volS * 0.4)};
+}
+function decide(p, m, ranked, index){
+  if(m.disc >= 80 && p.price >= 500){
+    return {act:"wait", tag:"建议核实",
+      why:"接口标价 " + yuan(p.price) + "，显示省 " + m.disc + "%。折扣幅度较大，建议核实同规格历史成交价。"};
   }
-  // 优先级2：低佣+零销量 → 换（市场验证不足）
-  if((p.commission_rate||0)<0.5 && (p.volume||0)===0){
-    return {act:"swap", tag:"低佣低销",
-      why:"佣金仅 "+(p.commission_rate||0)+"% 且日销 0，平台与市场验证均不足，谨慎入手"};
+  const alternative = p.category && ranked.find(x => x.p.id !== p.id
+    && x.p.category === p.category && x.p.coupon_price < p.coupon_price);
+  if(m.disc < 15 && alternative){
+    return {act:"swap", tag:"同品类有较低价",
+      why:"本批同品类中有到手价更低的候选：" + alternative.p.name
+        + "（" + yuan(alternative.p.coupon_price) + "）。选购前请核对型号和规格。"};
   }
-  // 优先级3：强折扣且划算分靠前 → 买
-  const topN = Math.max(1, Math.ceil(ranked.length*0.4));
-  const rank = ranked.findIndex(x=>x.id===p.id)+1;
-  if(m.disc>=60 && rank<=topN){
-    return {act:"buy", tag:"大促好价",
-      why:"券后省 "+m.disc+"%（" +yuan(p.price)+" → "+yuan(p.coupon_price)+"），划算分在本组前 "+Math.round(100*rank/ranked.length)+"%，可入手"};
+  const topN = Math.max(1, Math.ceil(ranked.length * 0.4));
+  if(m.disc >= 60 && index < topN){
+    return {act:"buy", tag:"折扣较大",
+      why:"到手价较接口标价低 " + m.disc + "%，划算分排名 " + (index + 1) + "，可考虑入手。"};
   }
-  // 优先级4：折扣偏低 → 等
-  if(m.disc<45){
-    return {act:"wait", tag:"力度不足",
-      why:"当前仅省 "+m.disc+"%，未到大促级力度，非急用建议等 618 / 大促再入手"};
-  }
-  // 其余：中等折扣或存疑 → 等
   return {act:"wait", tag:"可观望",
-    why:"省 "+m.disc+"% 但日销 "+(p.volume||0)+" 件、佣金 "+(p.commission_rate||0)+"%，市场验证偏弱，建议观望或对比同类"};
+    why:"当前到手价较接口标价低 " + m.disc + "%。可继续观察或核对同类商品。"};
 }
 
 function sorted(kw){
-  const list = DATA.keywords[kw] || [];
-  const arr = list.map(p=>({p, m:metrics(p)}));
-  arr.sort((a,b)=>b.m.score-a.m.score);
-  return arr;
+  return (DATA.keywords[kw] || []).map(p => ({p, m:metrics(p)}))
+    .filter(x => x.m !== null).sort((a,b) => b.m.score - a.m.score);
 }
 
 // 页面内提示（不依赖 alert：预览面板/iframe 里 alert 常被屏蔽，点了会像没反应）
@@ -253,7 +249,8 @@ function run(kw, scroll){
   curItems = ranked.map(x=>x.p);
   $("#rhead").style.display="flex";
   $("#rkw").textContent="「"+kw+"」比价结果";
-  $("#rcnt").textContent=ranked.length+" 件商品";
+  const unranked = DATA.keywords[kw].length - ranked.length;
+  $("#rcnt").textContent = ranked.length + " 件商品" + (unranked ? " · " + unranked + " 件价格未知" : "");
 
   const grid=$("#grid");
   grid.innerHTML = ranked.map((x,i)=>{
@@ -265,7 +262,7 @@ function run(kw, scroll){
       '<div class="pshop">'+ esc(p.nick||p.brand||"淘宝") +'</div>'+
       '<div class="pprice"><span class="now"><small>¥</small>'+ (p.coupon_price||0) +'</span>'+
         '<span class="old">¥'+p.price+'</span><span class="off">省'+m.disc+'%</span></div>'+
-      '<div class="pfoot"><span>日销 '+(p.volume||0)+'</span><span>佣金 '+(p.commission_rate||0)+'%</span>'+
+      '<div class="pfoot"><span>日销 '+(readNumber(p.volume) ?? "未知")+'</span><span>佣金 '+(readNumber(p.commission_rate) === null ? "未知" : p.commission_rate + "%")+'</span>'+
         '<span class="score">'+m.score+'<small> 划算分</small></span></div></div></div>';
   }).join("");
   [...grid.querySelectorAll(".pitem")].forEach(el=>{
@@ -281,7 +278,7 @@ function esc(s){return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">"
 
 function openDecision(idx, ranked){
   const p=ranked[idx].p, m=ranked[idx].m;
-  const dc=decide(p,m,ranked.map(x=>x.p));
+  const dc=decide(p,m,ranked,idx);
   const actMap={buy:["买","建议入手","buy"],wait:["等","建议观望","wait"],swap:["换","建议换款","swap"]};
   const A=actMap[dc.act];
 
@@ -306,21 +303,21 @@ function openDecision(idx, ranked){
        '<div class="dshop">'+esc(p.nick||p.brand||"淘宝")+(p.category?' · '+esc(p.category):'')+'</div>'+
        '<div class="dprice"><b>¥'+(p.coupon_price||0)+'</b><span class="old">¥'+p.price+'</span>'+
        '<span class="off">省'+m.disc+'%</span></div>'+
-       '<div style="font-size:12px;color:var(--sub);margin-top:6px">日销 '+(p.volume||0)+' 件 · 佣金率 '+(p.commission_rate||0)+'%</div>'+
+       '<div style="font-size:12px;color:var(--sub);margin-top:6px">日销 '+(readNumber(p.volume) ?? "未知")+' 件 · 佣金率 '+(readNumber(p.commission_rate) === null ? "未知" : p.commission_rate + "%")+'</div>'+
      '</div>'+
      '<div class="act '+A[2]+'"><div class="a1">决策结论</div><div class="a2">'+A[0]+'</div><div class="a3">'+dc.tag+'</div></div>'+
    '</div><div class="dbody">'+
      '<div class="scorebar"><span class="snum">'+m.score+'</span>'+
-       '<span class="slb">划算分<br><small style="font-weight:400;color:#3c6b58">越高越值得买</small></span>'+
-       '<span class="sform">折扣 '+m.disc+' ×50% + 销量分 '+Math.round(m.volS)+' ×30% + 佣金分 '+Math.round(m.commS)+' ×20%</span>'+
+       '<span class="slb">划算分<br><small style="font-weight:400;color:#3c6b58">当前结果内排序</small></span>'+
+       '<span class="sform">折扣 '+m.disc+' ×60% + 日销分 '+Math.round(m.volS)+' ×40%</span>'+
      '</div>'+
      '<div class="sec-t"><span class="no">01</span> 决策依据（可解释，非黑箱）</div>'+
      '<div class="ev'+(dc.act==='swap'?' bad':(dc.act==='wait'?' warn':''))+'"><span class="ic">✓</span><div>'+esc(dc.why)+'</div></div>'+
      '<div class="ev"><span class="ic">✓</span><div>券后到手价 <b>'+yuan(p.coupon_price)+'</b>，较原价 '+yuan(p.price)+' 省 <b>'+m.disc+'%</b></div></div>'+
-     '<div class="ev"><span class="ic">✓</span><div>市场验证：日销 <b>'+(p.volume||0)+'</b> 件、佣金率 <b>'+(p.commission_rate||0)+'%</b>（低佣低销已在决策中降权）</div></div>'+
+     '<div class="ev"><span class="ic">✓</span><div>日销 <b>'+(readNumber(p.volume) ?? "未知")+'</b> 件 · 佣金率 <b>'+(readNumber(p.commission_rate) === null ? "未知" : p.commission_rate + "%")+'</b>（仅展示）</div></div>'+
      '<div class="sec-t"><span class="no">02</span> 券后价拆解（API 原始促销明细）</div>'+
      '<div class="promo">'+promos+'</div>'+
-     '<div class="sec-t"><span class="no">03</span> 同类横向比价（同批商品中券后价最低 3 款）</div>'+
+     '<div class="sec-t"><span class="no">03</span> 本批候选到手价（最低 3 款）</div>'+
      '<table class="cmp"><thead><tr><th>商品</th><th>券后价</th><th>折扣</th><th>划算分</th></tr></thead><tbody>'+cmpRows+'</tbody></table>'+
      '<div class="sec-t"><span class="no">04</span> 数据源边界</div>'+
      '<div class="pending"><b>待接入：</b>近30天历史价位、评论去水（刷单识别）、京东 / 拼多多跨平台比价 —— 相应数据源尚未接入，砍价侠如实标注，不含虚构数字。</div>'+

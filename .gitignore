@@ -10,6 +10,10 @@ _*
 # 用户配置（含联盟密钥，切勿提交）
 config.json
 
+# 本地生成的报告和价格记录
+/report.html
+/price_history.sqlite3*
+
 # 系统
 .DS_Store
 Thumbs.db
