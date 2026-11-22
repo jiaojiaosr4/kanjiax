@@ -12,9 +12,51 @@ import urllib.request
 import urllib.parse
 import json
 import os
+from functools import partial
 from pathlib import Path
 
 from engine import read_number, read_price
+
+
+def mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def text_value(value):
+    return value.strip() if isinstance(value, str) else ""
+
+
+def identifier(value):
+    return str(value) if type(value) is int else text_value(value)
+
+
+def records(value):
+    if isinstance(value, dict):
+        return [value]
+    return value if isinstance(value, list) else []
+
+
+class ProductBatch(list):
+    """保留商品列表的调用方式，同时携带本次跳过的记录数。"""
+
+    def __init__(self):
+        super().__init__()
+        self.skipped = 0
+
+
+def collect_products(raw, normalize, source, *, limit=None):
+    if raw is not None and not isinstance(raw, (list, dict)):
+        raise RuntimeError(f"{source}返回的商品列表结构异常")
+    products = ProductBatch()
+    for item in records(raw)[:limit]:
+        product = normalize(item) if isinstance(item, dict) else None
+        if product and product["name"]:
+            products.append(product)
+        else:
+            products.skipped += 1
+    if products.skipped and not products:
+        raise RuntimeError(f"{source}返回了 {products.skipped} 条无效商品记录，本次无法生成结果")
+    return products
 
 
 def read_config(section, config_path=None):
@@ -32,23 +74,63 @@ def read_config(section, config_path=None):
 
 
 def _normalize_prices(price_info):
-    return (
-        read_price(price_info.get("reserve_price")),
-        read_price(price_info.get("final_promotion_price"))
-        or read_price(price_info.get("zk_final_price")),
-    )
+    price = read_price(price_info.get("reserve_price"))
+    for field in ("final_promotion_price", "zk_final_price"):
+        checkout = read_price(price_info.get(field))
+        if checkout is not None:
+            return price, checkout, field
+    return price, None, ""
 
 
 def _commission_rate(published):
-    rate = read_number((published.get("income_info") or {}).get("commission_rate"))
+    rate = read_number(mapping(published.get("income_info")).get("commission_rate"))
     return rate / 100 if rate is not None else None
 
 
 def _promotions(price_info):
-    paths = (price_info.get("final_promotion_path_list") or {}).get("final_promotion_path_map_data") or []
-    if isinstance(paths, dict):
-        paths = [paths]
-    return [p["promotion_desc"] for p in paths if p.get("promotion_desc")]
+    paths = mapping(price_info.get("final_promotion_path_list")).get("final_promotion_path_map_data")
+    descriptions = (text_value(mapping(path).get("promotion_desc")) for path in records(paths))
+    return [description for description in descriptions if description]
+
+
+def _taobao_records(response, response_key, container_key, records_key):
+    if "error_response" in mapping(response):
+        error = mapping(response["error_response"])
+        raise RuntimeError(
+            f"淘宝联盟返回错误：code={error.get('code')} {error.get('sub_code', '')} {error.get('sub_msg', '')}"
+        )
+    data = mapping(response).get(response_key)
+    if not isinstance(data, dict):
+        raise RuntimeError("淘宝联盟响应结构异常")
+    container = data.get(container_key)
+    if container is not None and not isinstance(container, dict):
+        raise RuntimeError("淘宝联盟结果结构异常")
+    return mapping(container).get(records_key)
+
+
+def _taobao_product(item, *, detail=False):
+    basic = mapping(item.get("item_basic_info"))
+    price_info = mapping(item.get("price_promotion_info"))
+    published = mapping(item.get("publish_info"))
+    title = text_value(basic.get("title")).replace("<em>", "").replace("</em>", "").strip()
+    price, checkout, price_source = _normalize_prices(price_info)
+    url = text_value(basic.get("item_url") if detail else published.get("click_url"))
+    return {
+        "id": identifier(item.get("item_id")),
+        "name": title,
+        "platform": "淘宝",
+        "price": price,
+        "coupon_price": checkout,
+        "price_source": price_source,
+        "commission_rate": _commission_rate(published),
+        "volume": read_number(published.get("daily_promotion_sales")),
+        "url": "https:" + url if url.startswith("//") else url,
+        "pict_url": text_value(basic.get("pict_url")),
+        "nick": text_value(basic.get("shop_title")),
+        "brand": text_value(basic.get("brand_name")),
+        "category": text_value(basic.get("category_name")),
+        "promotions": _promotions(price_info),
+    }
 
 
 # ============================================================
@@ -140,47 +222,10 @@ class TbkAdapter:
         }
         data = self._call("taobao.tbk.dg.material.optional.upgrade", biz)
 
-        if "error_response" in data:
-            er = data["error_response"]
-            raise RuntimeError(f"联盟 API 返回错误：code={er.get('code')} {er.get('sub_code','')} {er.get('sub_msg','')}")
-
-        # 升级版返回嵌套结构，字段分布在 item_basic_info / price_promotion_info / publish_info
-        resp = data.get("tbk_dg_material_optional_upgrade_response") or {}
-        items = (resp.get("result_list") or {}).get("map_data") or []
-        if isinstance(items, dict):
-            items = [items]
-
-        products = []
-        for it in items[:page_size]:
-            basic = it.get("item_basic_info") or {}
-            price_info = it.get("price_promotion_info") or {}
-            pub = it.get("publish_info") or {}
-            title = (basic.get("title") or "").replace("<em>", "").replace("</em>", "")
-            # 到手价优先取 final_promotion_price（含券），否则取 zk_final_price
-            reserve, coupon_price = _normalize_prices(price_info)
-            # 佣金率：联盟返回 "300" 表示 3.00%
-            commission_rate = _commission_rate(pub)
-            # 推广链接可能是 // 开头，补全协议
-            click_url = pub.get("click_url", "") or ""
-            if click_url.startswith("//"):
-                click_url = "https:" + click_url
-
-            products.append({
-                "id": str(it.get("item_id") or ""),
-                "name": title.strip(),
-                "platform": "淘宝",
-                "price": reserve,
-                "coupon_price": coupon_price,
-                "commission_rate": commission_rate,
-                "volume": read_number(pub.get("daily_promotion_sales")),
-                "url": click_url,
-                "pict_url": basic.get("pict_url", ""),
-                "nick": basic.get("shop_title", ""),
-                "brand": basic.get("brand_name", ""),
-                "category": basic.get("category_name", ""),
-                "promotions": _promotions(price_info),
-            })
-        return products
+        items = _taobao_records(
+            data, "tbk_dg_material_optional_upgrade_response", "result_list", "map_data"
+        )
+        return collect_products(items, _taobao_product, "淘宝联盟", limit=page_size)
 
     def item_info(self, item_id):
         """按商品 ID 查询真实商品详情（价格、标题、主图、佣金、促销）。
@@ -201,42 +246,10 @@ class TbkAdapter:
         }
         data = self._call("taobao.tbk.item.info.upgrade.get", biz)
 
-        if "error_response" in data:
-            er = data["error_response"]
-            raise RuntimeError(f"联盟 API 返回错误：code={er.get('code')} {er.get('sub_code','')} {er.get('sub_msg','')}")
-
-        resp = data.get("tbk_item_info_upgrade_get_response") or {}
-        details = (resp.get("results") or {}).get("tbk_item_detail") or []
-        if isinstance(details, dict):
-            details = [details]
-
-        products = []
-        for d in details:
-            basic = d.get("item_basic_info") or {}
-            price_info = d.get("price_promotion_info") or {}
-            pub = d.get("publish_info") or {}
-            title = (basic.get("title") or "").replace("<em>", "").replace("</em>", "")
-            # 到手价优先取 final_promotion_price（含券），否则取 zk_final_price
-            reserve, coupon_price = _normalize_prices(price_info)
-            # 佣金率：联盟返回 "300" 表示 3.00%
-            commission_rate = _commission_rate(pub)
-
-            products.append({
-                "id": str(d.get("item_id") or ""),
-                "name": title.strip(),
-                "platform": "淘宝",
-                "price": reserve,
-                "coupon_price": coupon_price,
-                "commission_rate": commission_rate,
-                "volume": read_number(pub.get("daily_promotion_sales")),
-                "url": basic.get("item_url", ""),
-                "pict_url": basic.get("pict_url", ""),
-                "nick": basic.get("shop_title", ""),
-                "brand": basic.get("brand_name", ""),
-                "category": basic.get("category_name", ""),
-                "promotions": _promotions(price_info),
-            })
-        return products
+        items = _taobao_records(
+            data, "tbk_item_info_upgrade_get_response", "results", "tbk_item_detail"
+        )
+        return collect_products(items, partial(_taobao_product, detail=True), "淘宝联盟")
 
 
 # ============================================================

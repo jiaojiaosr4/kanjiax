@@ -11,9 +11,11 @@ from statistics import mean
 
 def read_number(value):
     """保留有效的非负数，缺失或无效值用 None 表示。"""
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if isfinite(number) and number >= 0 else None
 
@@ -31,7 +33,38 @@ def discount_percentage(price, checkout_price):
     checkout_price = read_price(checkout_price)
     if price is None or checkout_price is None:
         return None
-    return _round_score(max(0, 100 * (price - checkout_price) / price))
+    return _round_score(max(0, 100 * ((price - checkout_price) / price)))
+
+
+def taobao_price_decision(product, comparable_history=()):
+    """为淘宝单品和离线商品快照生成相同的价格建议。"""
+    listed = read_price(product.get("price"))
+    checkout = read_price(product.get("coupon_price"))
+    discount = discount_percentage(listed, checkout)
+    if discount is None:
+        action, label = "资料不足", "价格未知"
+        reason = "联盟未提供完整标价和到手价，暂无法计算折扣并推荐。"
+    elif len(comparable_history) >= 3 and (
+        history := analyze_price_history(comparable_history, checkout)
+    )["position"] == "高位":
+        action, label = "等", "高于可比低点"
+        reason = (
+            f"到手价较已记录的同条件最低价 ¥{history['min']:g} "
+            f"高 {history['distance_to_low_pct']:g}%，可继续观察。"
+        )
+    elif discount >= 80 and listed >= 500:
+        action, label = "等", "建议核实"
+        reason = f"接口标价 ¥{listed:g}，显示省 {discount:g}%。折扣幅度较大，建议核实同规格成交价。"
+    elif discount >= 15:
+        action, label = "买", "当前有折扣"
+        reason = f"当前到手价比接口标价低 {discount:g}%，可考虑入手。"
+    elif discount > 0:
+        action, label = "等", "可观望"
+        reason = f"当前到手价比接口标价低 {discount:g}%，可等更合适的促销。"
+    else:
+        action, label = "等", "可观望"
+        reason = "当前到手价无可确认的折扣，可继续观察。"
+    return {"action": action, "label": label, "reason": reason}
 
 
 def compare_prices(prices):
