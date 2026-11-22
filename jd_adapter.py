@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-from adapter import read_config
+from adapter import collect_products, identifier, mapping, read_config, records, text_value
 from engine import read_number, read_price
 
 GATEWAY = "https://router.jd.com/api"
@@ -86,20 +86,22 @@ class JdAdapter:
         req = urllib.request.Request(url, headers={"User-Agent": "kanjiax/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            raise RuntimeError("京东联盟 API 返回结构异常")
         if "error_response" in data:
-            er = data["error_response"]
+            er = mapping(data["error_response"])
             raise RuntimeError(
                 f"京东联盟 API 错误：code={er.get('code')} zh_desc={er.get('zh_desc','')} msg={er.get('en_desc','')}"
             )
         resp_key = method.replace(".", "_") + "_response"
         payload = data.get(resp_key)
-        if payload is None:
+        if not isinstance(payload, dict):
             raise RuntimeError(f"京东联盟 API 返回结构异常：{list(data.keys())}")
         # 京东联盟把业务结果塞在 result 字符串里，这里统一解析
         r = payload.get("result")
         if isinstance(r, str):
             r = json.loads(r)
-        return r if isinstance(r, dict) else {}
+        return r
 
     # ---- 业务：京粉精选（个人导购媒体可用通道）----
     def jingfen_select(self, elite_id=1, page_size=20, page_index=1):
@@ -116,73 +118,72 @@ class JdAdapter:
             "jd.union.open.goods.jingfen.query",
             {"goodsReq": {"eliteId": int(elite_id), "pageIndex": int(page_index), "pageSize": int(page_size)}},
         )
+        if not isinstance(r, dict):
+            raise RuntimeError("京粉精选返回结构异常")
         if r.get("code") != 200:
             raise RuntimeError(f"京粉精选返回错误：code={r.get('code')} msg={r.get('message','')}")
 
-        items = r.get("data") or []
-        return [self._normalize(it) for it in items]
+        return collect_products(r.get("data"), self._normalize, "京东联盟")
 
     def _normalize(self, it):
         """把京粉精选字段规整成砍价侠统一商品结构（+ 证据链用的真实扩展字段）。"""
-        price_info = it.get("priceInfo") or {}
+        price_info = mapping(it.get("priceInfo"))
         price = read_price(price_info.get("price"))
         # 只使用接口明确提供的到手价，保留缺失状态。
         coupon_price = read_price(price_info.get("lowestCouponPrice")) or read_price(
-            (it.get("purchasePriceInfo") or {}).get("purchasePrice")
+            mapping(it.get("purchasePriceInfo")).get("purchasePrice")
         )
 
         # 优惠券明细（真实券面额 + 门槛）
         promotions = []
         coupon_quota = 0.0
         coupon_discount = 0.0
-        for c in (it.get("couponInfo") or {}).get("couponList") or []:
-            d, q = _f(c.get("discount")), _f(c.get("quota"))
+        for c in records(mapping(it.get("couponInfo")).get("couponList")):
+            coupon = mapping(c)
+            d = read_number(coupon.get("discount")) or 0
+            q = read_number(coupon.get("quota")) or 0
             if d > 0:
                 promotions.append(f"满{q:g}减{d:g}元" if q > 0 else f"减{d:g}元")
                 if d > coupon_discount:
                     coupon_discount, coupon_quota = d, q
 
         # 主图
-        img_info = it.get("imageInfo") or {}
-        img_list = img_info.get("imageList") or []
-        pict = img_list[0].get("url", "") if img_list else img_info.get("whiteImage", "")
+        img_info = mapping(it.get("imageInfo"))
+        img_urls = (text_value(mapping(img).get("url")) for img in records(img_info.get("imageList")))
+        pict = next(filter(None, img_urls), text_value(img_info.get("whiteImage")))
 
         # 推广落地页
-        mat = it.get("materialUrl") or ""
-        url = mat if mat.startswith("http") else ("https://" + mat if mat else "")
+        mat = text_value(it.get("materialUrl"))
+        url = "https:" + mat if mat.startswith("//") else mat
+        if url and not url.startswith(("http://", "https://")):
+            url = "https://" + url
 
-        comm = read_number((it.get("commissionInfo") or {}).get("commissionShare"))
-        shop = it.get("shopInfo") or {}
+        comm = read_number(mapping(it.get("commissionInfo")).get("commissionShare"))
+        shop = mapping(it.get("shopInfo"))
+        tags = (text_value(mapping(tag).get("name")) for tag in records(it.get("skuTagList")))
         return {
-            "id": str(it.get("skuId") or it.get("itemId") or it.get("spuid") or ""),
-            "name": (it.get("skuName") or "").strip(),
+            "id": identifier(it.get("skuId")) or identifier(it.get("itemId")) or identifier(it.get("spuid")),
+            "name": text_value(it.get("skuName")),
             "platform": "京东",
             "price": price,
             "coupon_price": coupon_price,
             "commission_rate": comm,
             "volume": read_number(it.get("inOrderCount30Days")),
             "url": url,
-            "pict_url": (pict or "").replace("http://", "https://"),
+            "pict_url": pict.replace("http://", "https://"),
             "promotions": promotions,
             # ==== 证据链用的真实扩展字段（全部来自接口，无编造）====
             "coupon_discount": coupon_discount,
             "coupon_quota": coupon_quota,
             "comments": read_number(it.get("comments")),
             "good_rate": read_number(it.get("goodCommentsShare")),
-            "category_id": str((it.get("categoryInfo") or {}).get("cid3") or ""),
-            "brand": it.get("brandName") or "",
-            "shop": shop.get("shopName") or "",
+            "category_id": identifier(mapping(it.get("categoryInfo")).get("cid3")),
+            "brand": text_value(it.get("brandName")),
+            "shop": text_value(shop.get("shopName")),
             "shop_score": shop.get("userEvaluateScore") or "",
-            "tags": [t.get("name") for t in (it.get("skuTagList") or []) if t.get("name")],
-            "elite_name": (it.get("resourceInfo") or {}).get("eliteName") or "",
+            "tags": list(filter(None, tags)),
+            "elite_name": text_value(mapping(it.get("resourceInfo")).get("eliteName")),
         }
-
-
-def _f(v):
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 def extract_jd_sku(text):

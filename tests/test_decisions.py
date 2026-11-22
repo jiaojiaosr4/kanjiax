@@ -2,6 +2,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 import main
 from adapter import TbkAdapter
+from build_snapshot_decisions import DATA_PREFIX, DECISIONS_PREFIX, render_snapshot
 from data import HEADPHONE
 from engine import analyze_price_history, analyze_product, analyze_search_results, detect_fake_reviews
 from jd_adapter import JdAdapter
@@ -91,6 +93,34 @@ class DecisionTests(unittest.TestCase):
         self.assertIn("本次未生成商品结果", report)
         self.assertNotIn("上一份报告", report)
 
+    def test_taobao_recovers_from_partial_batches_and_replaces_failed_reports(self):
+        adapter = TbkAdapter("test", "test", "1")
+        valid = tbk_item("有效商品", "50")
+        valid["price_promotion_info"]["final_promotion_path_list"] = {
+            "final_promotion_path_map_data": [None, {"promotion_desc": "满减"}]
+        }
+        with tempfile.TemporaryDirectory() as folder, chdir(folder), \
+                patch.object(TbkAdapter, "load", return_value=adapter), \
+                patch.object(adapter, "_call") as call, \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            path = Path("report.html")
+            for args, response_key, container, field in (
+                (["--tbk", "耳机"], "tbk_dg_material_optional_upgrade_response", "result_list", "map_data"),
+                (["--item", "a"], "tbk_item_info_upgrade_get_response", "results", "tbk_item_detail"),
+            ):
+                with self.subTest(args=args):
+                    call.return_value = {response_key: {container: {field: [None, {}, valid]}}}
+                    self.assertEqual(main.main(args), 0)
+                    self.assertIn("已跳过 2 条无效商品记录", path.read_text(encoding="utf-8"))
+                    self.assertIn("有效商品", path.read_text(encoding="utf-8"))
+
+                    call.return_value = {response_key: {container: {field: [None]}}}
+                    self.assertEqual(main.main(args), 1)
+                    report = path.read_text(encoding="utf-8")
+                    self.assertIn("本次未生成商品结果", report)
+                    self.assertIn("返回了 1 条无效商品记录", report)
+                    self.assertNotIn("有效商品</", report)
+
     def test_jd_alternatives_match_category_and_use_real_order_count(self):
         adapter = JdAdapter("test", "test")
         mixed = [
@@ -101,11 +131,14 @@ class DecisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, chdir(folder), \
                 patch.object(JdAdapter, "from_config", return_value=adapter), \
                 patch.object(adapter, "_call") as call, redirect_stdout(io.StringIO()) as output:
-            call.return_value = {"code": 200, "data": mixed}
+            mixed[0]["couponInfo"] = {"couponList": [None, {"discount": 10, "quota": 100}]}
+            call.return_value = {"code": 200, "data": [None, *mixed]}
             self.assertEqual(main.main(["--jd"]), 0)
             report = Path("report.html").read_text(encoding="utf-8")
             self.assertIn("同品类较低价候选：同品类耳机", report)
             self.assertNotIn("同品类较低价候选：纸巾", report)
+            self.assertIn("已跳过 1 条无效商品记录", report)
+            self.assertIn("满100减10元", report)
             call.return_value = {"code": 200, "data": [jd_item(4, "耳机", 100, 100, 50, 0)]}
             self.assertEqual(main.main(["--jd"]), 0)
             self.assertIn("【等】", output.getvalue())
@@ -150,6 +183,93 @@ class DecisionTests(unittest.TestCase):
             other = record_price({**product, "id": "two"}, database=db, observed_at=day)
             self.assertEqual(len(other), 1)
             self.assertIn("<svg", main.plot_history_svg(analyze_price_history(other, 70)))
+
+    def test_history_compares_only_confirmed_conditions(self):
+        now = datetime.now(CHINA_TIME)
+        product = {"id": "one", "name": "电动牙刷", "platform": "淘宝",
+                   "price": 130, "coupon_price": 109, "volume": 0,
+                   "price_source": "final_promotion_price", "promotions": ["普通优惠"]}
+        context = dict(specification="型号 A 黑色单机", eligibility="普通用户")
+        adapter = TbkAdapter("test", "test", "1")
+        with tempfile.TemporaryDirectory() as folder, chdir(folder), \
+                patch.object(TbkAdapter, "load", return_value=adapter), \
+                patch.object(adapter, "item_info", return_value=[product]), \
+                redirect_stdout(io.StringIO()):
+            for days_ago in (2, 1):
+                day = now - timedelta(days=days_ago)
+                record_price({**product, "coupon_price": 75}, observed_at=day)
+                record_price({**product, "coupon_price": 79}, observed_at=day,
+                             specification=context["specification"], eligibility="仅新用户")
+                record_price({**product, "coupon_price": 78, "promotions": ["仅新用户券"]},
+                             observed_at=day, **context)
+                record_price({**product, "coupon_price": 77, "price_source": "zk_final_price"},
+                             observed_at=day, **context)
+                record_price({**product, "coupon_price": 76}, observed_at=day,
+                             specification="型号 A 黑色双支套装", eligibility=context["eligibility"])
+            path = Path("report.html")
+            args = ["--item", "one", "--track-price"]
+            self.assertEqual(main.main(args), 0)
+            report = path.read_text(encoding="utf-8")
+            self.assertIn("价格记录仅供查看", report)
+            self.assertIn("可考虑入手", report)
+
+            confirmed_args = args + [
+                "--price-spec", context["specification"], "--price-eligibility", context["eligibility"],
+            ]
+            self.assertEqual(main.main(confirmed_args), 0)
+            report = path.read_text(encoding="utf-8")
+            self.assertIn("共记录 1 天", report)
+            self.assertIn("可考虑入手", report)
+
+            for days_ago in (2, 1):
+                record_price({**product, "coupon_price": 90},
+                             observed_at=now - timedelta(days=days_ago), **context)
+            self.assertEqual(main.main(confirmed_args), 0)
+            report = path.read_text(encoding="utf-8")
+            self.assertIn("共记录 3 天", report)
+            self.assertIn("同条件最低价 ¥90", report)
+
+    def test_legacy_history_remains_readable_but_cannot_enter_confirmed_series(self):
+        day = datetime(2026, 11, 22, 12, tzinfo=CHINA_TIME)
+        product = {"id": "one", "platform": "淘宝", "price": 100, "coupon_price": 90}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, "prices.sqlite3")
+            with sqlite3.connect(path) as connection:
+                connection.execute("""
+                    CREATE TABLE price_observations (
+                        platform, item_id, day, observed_at, listed_price, checkout_price,
+                        promotions, PRIMARY KEY (platform, item_id, day)
+                    )
+                """)
+                connection.execute("""
+                    INSERT INTO price_observations VALUES
+                    ('淘宝', 'one', '2026-11-21', '2026-11-21T12:00:00+08:00', 100, 50, '[]')
+                """)
+            connection.close()
+            confirmed = record_price(product, database=path, observed_at=day,
+                                     specification="型号 A", eligibility="普通用户")
+            self.assertEqual(confirmed, [{"date": "2026-11-22", "price": 90}])
+            unknown = record_price(product, database=path, observed_at=day)
+            self.assertEqual([row["price"] for row in unknown], [50, 90])
+
+    def test_snapshot_decisions_match_single_item_cli(self):
+        page = (Path(__file__).resolve().parents[1] / "index.html").read_text(encoding="utf-8")
+        self.assertTrue(render_snapshot(page) == page, "课堂页里的建议需要重新生成")
+        lines = page.splitlines()
+        data = next(line for line in lines if line.startswith(DATA_PREFIX))
+        decisions = next(line for line in lines if line.startswith(DECISIONS_PREFIX))
+        brushes = json.loads(data[len(DATA_PREFIX):-1])["keywords"]["电动牙刷"]
+        sample = next(p for p in brushes if p["price"] == 1599 and p["coupon_price"] == 304)
+        expected = json.loads(decisions[len(DECISIONS_PREFIX):-1])
+        expected = expected["电动牙刷"][sample["id"]]
+        self.assertEqual(expected["action"], "等")
+        adapter = TbkAdapter("test", "test", "1")
+        with tempfile.TemporaryDirectory() as folder, chdir(folder), \
+                patch.object(TbkAdapter, "load", return_value=adapter), \
+                patch.object(adapter, "item_info", return_value=[sample]), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main.main(["--item", sample["id"]]), 0)
+            self.assertIn(f"【{expected['action']}】{expected['reason']}", output.getvalue())
 
     @unittest.skipUnless(shutil.which("node"), "需要 Node.js 校验课堂页评分")
     def test_classroom_and_python_use_identical_snapshot_ranking(self):

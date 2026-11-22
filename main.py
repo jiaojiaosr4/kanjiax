@@ -17,7 +17,10 @@ from tempfile import NamedTemporaryFile
 from urllib.parse import parse_qs, urlsplit
 
 from data import SAMPLE_PRODUCTS
-from engine import analyze_price_history, analyze_product, analyze_search_results, discount_percentage
+from engine import (
+    analyze_price_history, analyze_product, analyze_search_results,
+    discount_percentage, taobao_price_decision,
+)
 from price_history import record_price
 
 
@@ -39,6 +42,11 @@ JD_SOURCE = "京东联盟官方 API（京粉精选）"
 
 def format_metric(value, prefix="", suffix=""):
     return "未知" if value is None else f"{prefix}{value:g}{suffix}"
+
+
+def skipped_records_notice(products):
+    skipped = getattr(products, "skipped", 0)
+    return f'<p>已跳过 {skipped} 条无效商品记录。</p>' if skipped else ""
 
 
 def safe_url(url):
@@ -319,7 +327,7 @@ def run_tbk_mode(keyword):
         raise RuntimeError("淘宝联盟未返回匹配商品")
 
     result = analyze_search_results(keyword, products)
-    body = render_search_report(result)
+    body = skipped_records_notice(products) + render_search_report(result)
     write_report(body, f"砍价侠 · 「{keyword}」搜索报告", TBK_SOURCE)
 
     print("=" * 50)
@@ -347,7 +355,7 @@ def taobao_item_id(text):
     raise ValueError("请输入淘宝商品 ID 或带 id 参数的淘宝、天猫商品链接")
 
 
-def run_item_mode(query, track_price=False):
+def run_item_mode(query, track_price=False, *, specification="", eligibility=""):
     """查询淘宝联盟单品数据，可选保存当日到手价。"""
     from adapter import TbkAdapter
 
@@ -363,31 +371,28 @@ def run_item_mode(query, track_price=False):
 
     p = products[0]
     discount = discount_percentage(p["price"], p["coupon_price"])
-    history = record_price(p) if track_price else []
-    history_analysis = analyze_price_history(history, p["coupon_price"]) if history else None
+    specification, eligibility = specification.strip(), eligibility.strip()
+    confirmed = bool(specification and eligibility)
+    history = record_price(p, specification=specification, eligibility=eligibility) if track_price else []
     history_card = ""
     if track_price:
         history_card = '<p>缺少可记录的到手价或商品 ID，本次未新增价格记录。</p>'
-        if history_analysis:
+        if history:
+            history_analysis = analyze_price_history(history, p["coupon_price"])
+            context_notice = (
+                f'已核对规格 {html.escape(specification)}、优惠条件 {html.escape(eligibility)}。'
+                '相同条件至少记录 3 天后才使用历史价信号。'
+                if confirmed else '规格或优惠条件尚未核对，价格记录仅供查看。'
+            )
             history_card = (
                 '<h3>最近 30 个自然日内的到手价记录</h3>'
                 f'<p>共记录 {len(history)} 天，以当天最近一次查询为准，'
-                '价格可能随促销及规格变化。至少记录 3 天后使用历史价信号。</p>'
+                f'{context_notice}</p>'
                 f'{plot_history_svg(history_analysis)}'
             )
 
-    if discount is None:
-        action, reason = "资料不足", "联盟未提供完整标价和到手价，暂无法计算折扣并推荐。"
-    elif len(history) >= 3 and history_analysis["position"] == "高位":
-        gap = history_analysis["distance_to_low_pct"]
-        minimum = history_analysis["min"]
-        action, reason = "等", f"到手价较已记录最低价 ¥{minimum:g} 高 {gap:g}%，可继续观察。"
-    elif discount >= 15:
-        action, reason = "买", f"当前到手价比接口标价低 {discount:g}%，可考虑入手。"
-    elif discount > 0:
-        action, reason = "等", f"当前到手价比接口标价低 {discount:g}%，可等更合适的促销。"
-    else:
-        action, reason = "等", "当前到手价无可确认的折扣，可继续观察。"
+    decision = taobao_price_decision(p, history if confirmed else ())
+    action, reason = decision["action"], decision["reason"]
 
     listed_text = format_metric(p["price"], "¥")
     checkout_text = format_metric(p["coupon_price"], "¥")
@@ -429,7 +434,7 @@ def run_item_mode(query, track_price=False):
     {history_card}
     '''
 
-    write_report(card, f"砍价侠 · 淘宝单品 {item_id}", TBK_SOURCE)
+    write_report(skipped_records_notice(products) + card, f"砍价侠 · 淘宝单品 {item_id}", TBK_SOURCE)
 
     print("=" * 50)
     print("商品详情模式 · 报告已生成 -> report.html")
@@ -461,8 +466,9 @@ def run_jd_mode(elite):
     title = f"砍价侠 · {label}"
     result = analyze_search_results(label, products)
     ranked = result["ranked"]
+    notice = skipped_records_notice(products)
     if not ranked:
-        write_report(f'<p>本频道返回 {result["total"]} 件商品，均缺少标价或到手价，暂无法推荐。</p>', title, JD_SOURCE)
+        write_report(notice + f'<p>本频道返回 {result["total"]} 件商品，均缺少标价或到手价，暂无法推荐。</p>', title, JD_SOURCE)
         print("商品价格不完整，已生成无推荐结果的 report.html")
         return
 
@@ -574,7 +580,7 @@ def run_jd_mode(elite):
     </div>
     '''
 
-    write_report(card, title, JD_SOURCE)
+    write_report(notice + card, title, JD_SOURCE)
 
     print("=" * 50)
     print("京东模式 · 报告已生成 -> report.html")
@@ -591,10 +597,15 @@ def main(argv=None):
     modes.add_argument("--item", metavar="商品ID或链接", help="用淘宝联盟 API 查询商品详情")
     modes.add_argument("--jd", nargs="?", const=1, type=int, metavar="频道号", help="用京东联盟 API 查询京粉精选，默认频道 1")
     parser.add_argument("--track-price", action="store_true", help="在淘宝单品模式下保存今日到手价")
+    parser.add_argument("--price-spec", default="", metavar="规格", help="已经核对的商品型号、规格和套餐")
+    parser.add_argument("--price-eligibility", default="", metavar="适用条件", help="已经核对的优惠资格和适用条件")
     args = parser.parse_args(argv)
+    specification, eligibility = args.price_spec.strip(), args.price_eligibility.strip()
 
     if args.track_price and not args.item:
         parser.error("--track-price 仅用于 --item")
+    if (specification or eligibility) and not (args.track_price and specification and eligibility):
+        parser.error("--price-spec 和 --price-eligibility 必须同时用于 --track-price")
     if args.jd is not None and args.jd < 1:
         parser.error("--jd 频道号应为正整数")
 
@@ -605,7 +616,7 @@ def main(argv=None):
             run_tbk_mode(args.tbk)
         elif args.item is not None:
             title = f"砍价侠 · 淘宝单品「{args.item}」"
-            run_item_mode(args.item, args.track_price)
+            run_item_mode(args.item, args.track_price, specification=specification, eligibility=eligibility)
         elif args.jd is not None:
             title = f"砍价侠 · 京粉精选频道 {args.jd}"
             run_jd_mode(args.jd)
