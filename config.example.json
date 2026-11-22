@@ -5,15 +5,15 @@
     "京东联盟": "union.jd.com/openplatform：注册 → 创建「导购媒体（社交媒体推广）」资质并等审核 → 获得 appkey/secretkey → 创建推广位取得 unionId/siteId/positionId"
   },
   "tbk": {
-    "app_key": "在此填入淘宝 AppKey",
-    "app_secret": "在此填入淘宝 AppSecret",
-    "adzone_id": "在此填入推广位 ID（PID 末段数字）"
+    "app_key": "",
+    "app_secret": "",
+    "adzone_id": ""
   },
   "jd": {
-    "app_key": "在此填入京东 appkey",
-    "app_secret": "在此填入京东 secretkey",
-    "union_id": "在此填入 unionId",
-    "site_id": "在此填入 siteId",
-    "position_id": "在此填入 positionId"
+    "app_key": "",
+    "app_secret": "",
+    "union_id": "",
+    "site_id": "",
+    "position_id": ""
   }
 }

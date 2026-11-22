@@ -4,7 +4,7 @@
 # - SampleAdapter：内置示例数据（离线演示，无需配置）
 #
 # 联盟 API 返回真实商品价格、券后价、佣金率、销量，合规且稳定。
-# 评论与历史价格联盟不提供，分别由评论数据源（TODO）与自建 SQLite（TODO）补齐。
+# 联盟接口未提供评论正文与历史价格。历史价可由单品查询逐日记录。
 
 import hashlib
 import time
@@ -12,6 +12,43 @@ import urllib.request
 import urllib.parse
 import json
 import os
+from pathlib import Path
+
+from engine import read_number, read_price
+
+
+def read_config(section, config_path=None):
+    path = Path(config_path) if config_path is not None else Path("config.json")
+    if config_path is None and not path.is_file():
+        path = Path(__file__).with_name("config.json")
+    if not path.is_file():
+        return {}
+    with path.open(encoding="utf-8-sig") as config_file:
+        config = json.load(config_file)
+    values = config.get(section, {}) if isinstance(config, dict) else None
+    if not isinstance(values, dict):
+        raise ValueError(f"{path.name} 的 {section} 配置必须是 JSON 对象")
+    return values
+
+
+def _normalize_prices(price_info):
+    return (
+        read_price(price_info.get("reserve_price")),
+        read_price(price_info.get("final_promotion_price"))
+        or read_price(price_info.get("zk_final_price")),
+    )
+
+
+def _commission_rate(published):
+    rate = read_number((published.get("income_info") or {}).get("commission_rate"))
+    return rate / 100 if rate is not None else None
+
+
+def _promotions(price_info):
+    paths = (price_info.get("final_promotion_path_list") or {}).get("final_promotion_path_map_data") or []
+    if isinstance(paths, dict):
+        paths = [paths]
+    return [p["promotion_desc"] for p in paths if p.get("promotion_desc")]
 
 
 # ============================================================
@@ -43,18 +80,19 @@ class TbkAdapter:
         )
 
     @classmethod
-    def from_config(cls, config_path="config.json"):
+    def from_config(cls, config_path=None):
         """从 config.json 加载配置。"""
-        if not os.path.exists(config_path):
-            return cls()
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        tbk = cfg.get("tbk", {})
+        tbk = read_config("tbk", config_path)
         return cls(
             app_key=tbk.get("app_key"),
             app_secret=tbk.get("app_secret"),
             adzone_id=tbk.get("adzone_id"),
         )
+
+    @classmethod
+    def load(cls):
+        adapter = cls.from_env()
+        return adapter if adapter.configured() else cls.from_config()
 
     def configured(self):
         """是否已配置完整凭证。"""
@@ -107,45 +145,40 @@ class TbkAdapter:
             raise RuntimeError(f"联盟 API 返回错误：code={er.get('code')} {er.get('sub_code','')} {er.get('sub_msg','')}")
 
         # 升级版返回嵌套结构，字段分布在 item_basic_info / price_promotion_info / publish_info
-        resp = data.get("tbk_dg_material_optional_upgrade_response", {})
-        items = resp.get("result_list", {}).get("map_data", [])
+        resp = data.get("tbk_dg_material_optional_upgrade_response") or {}
+        items = (resp.get("result_list") or {}).get("map_data") or []
         if isinstance(items, dict):
             items = [items]
 
         products = []
         for it in items[:page_size]:
-            basic = it.get("item_basic_info", {})
-            price_info = it.get("price_promotion_info", {})
-            pub = it.get("publish_info", {})
+            basic = it.get("item_basic_info") or {}
+            price_info = it.get("price_promotion_info") or {}
+            pub = it.get("publish_info") or {}
             title = (basic.get("title") or "").replace("<em>", "").replace("</em>", "")
             # 到手价优先取 final_promotion_price（含券），否则取 zk_final_price
-            final_price = float(price_info.get("final_promotion_price", 0) or 0)
-            zk_price = float(price_info.get("zk_final_price", 0) or 0)
-            reserve = float(price_info.get("reserve_price", 0) or 0)
-            coupon_price = final_price if final_price > 0 else zk_price
+            reserve, coupon_price = _normalize_prices(price_info)
             # 佣金率：联盟返回 "300" 表示 3.00%
-            commission_rate = float(pub.get("income_info", {}).get("commission_rate", 0) or 0) / 100
+            commission_rate = _commission_rate(pub)
             # 推广链接可能是 // 开头，补全协议
             click_url = pub.get("click_url", "") or ""
             if click_url.startswith("//"):
                 click_url = "https:" + click_url
-            promos = price_info.get("final_promotion_path_list", {}).get("final_promotion_path_map_data", [])
-            promo_descs = [p.get("promotion_desc", "") for p in promos if p.get("promotion_desc")]
 
             products.append({
-                "id": str(it.get("item_id", "")),
+                "id": str(it.get("item_id") or ""),
                 "name": title.strip(),
                 "platform": "淘宝",
                 "price": reserve,
                 "coupon_price": coupon_price,
                 "commission_rate": commission_rate,
-                "volume": int(pub.get("daily_promotion_sales", 0) or 0),
+                "volume": read_number(pub.get("daily_promotion_sales")),
                 "url": click_url,
                 "pict_url": basic.get("pict_url", ""),
                 "nick": basic.get("shop_title", ""),
                 "brand": basic.get("brand_name", ""),
                 "category": basic.get("category_name", ""),
-                "promotions": promo_descs,
+                "promotions": _promotions(price_info),
             })
         return products
 
@@ -172,43 +205,36 @@ class TbkAdapter:
             er = data["error_response"]
             raise RuntimeError(f"联盟 API 返回错误：code={er.get('code')} {er.get('sub_code','')} {er.get('sub_msg','')}")
 
-        resp = data.get("tbk_item_info_upgrade_get_response", {})
-        details = resp.get("results", {}).get("tbk_item_detail", [])
+        resp = data.get("tbk_item_info_upgrade_get_response") or {}
+        details = (resp.get("results") or {}).get("tbk_item_detail") or []
         if isinstance(details, dict):
             details = [details]
 
         products = []
         for d in details:
-            basic = d.get("item_basic_info", {})
-            price_info = d.get("price_promotion_info", {})
-            pub = d.get("publish_info", {})
+            basic = d.get("item_basic_info") or {}
+            price_info = d.get("price_promotion_info") or {}
+            pub = d.get("publish_info") or {}
             title = (basic.get("title") or "").replace("<em>", "").replace("</em>", "")
             # 到手价优先取 final_promotion_price（含券），否则取 zk_final_price
-            final_price = float(price_info.get("final_promotion_price", 0) or 0)
-            zk_price = float(price_info.get("zk_final_price", 0) or 0)
-            reserve = float(price_info.get("reserve_price", 0) or 0)
-            coupon_price = final_price if final_price > 0 else zk_price
+            reserve, coupon_price = _normalize_prices(price_info)
             # 佣金率：联盟返回 "300" 表示 3.00%
-            commission_rate = float(pub.get("income_info", {}).get("commission_rate", 0) or 0) / 100
-
-            # 促销信息
-            promos = price_info.get("final_promotion_path_list", {}).get("final_promotion_path_map_data", [])
-            promo_descs = [p.get("promotion_desc", "") for p in promos if p.get("promotion_desc")]
+            commission_rate = _commission_rate(pub)
 
             products.append({
-                "id": str(d.get("item_id", "")),
+                "id": str(d.get("item_id") or ""),
                 "name": title.strip(),
                 "platform": "淘宝",
                 "price": reserve,
                 "coupon_price": coupon_price,
                 "commission_rate": commission_rate,
-                "volume": int(pub.get("daily_promotion_sales", 0) or 0),
+                "volume": read_number(pub.get("daily_promotion_sales")),
                 "url": basic.get("item_url", ""),
                 "pict_url": basic.get("pict_url", ""),
                 "nick": basic.get("shop_title", ""),
                 "brand": basic.get("brand_name", ""),
                 "category": basic.get("category_name", ""),
-                "promotions": promo_descs,
+                "promotions": _promotions(price_info),
             })
         return products
 
@@ -233,10 +259,7 @@ class SampleAdapter:
 
 def get_default_adapter():
     """优先用联盟 API（如已配置），否则回退示例数据。"""
-    tbk = TbkAdapter.from_config()
-    if tbk.configured():
-        return tbk
-    tbk = TbkAdapter.from_env()
+    tbk = TbkAdapter.load()
     if tbk.configured():
         return tbk
     return SampleAdapter()

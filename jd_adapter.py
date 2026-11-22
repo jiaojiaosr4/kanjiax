@@ -24,6 +24,9 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
+from adapter import read_config
+from engine import read_number, read_price
+
 GATEWAY = "https://router.jd.com/api"
 
 
@@ -39,9 +42,8 @@ class JdAdapter:
 
     @classmethod
     def from_config(cls):
-        cfg = {}
         env = os.environ
-        if env.get("JD_APP_KEY"):
+        if env.get("JD_APP_KEY") and env.get("JD_APP_SECRET"):
             cfg = {
                 "app_key": env.get("JD_APP_KEY", ""),
                 "app_secret": env.get("JD_APP_SECRET", ""),
@@ -50,12 +52,7 @@ class JdAdapter:
                 "position_id": env.get("JD_POSITION_ID", ""),
             }
         else:
-            here = os.path.dirname(os.path.abspath(__file__))
-            for root, _dirs, files in os.walk(here):
-                if "config.json" in files:
-                    with open(os.path.join(root, "config.json"), encoding="utf-8-sig") as f:
-                        cfg = json.load(f).get("jd", {})
-                    break
+            cfg = read_config("jd")
         return cls(
             cfg.get("app_key", ""),
             cfg.get("app_secret", ""),
@@ -128,11 +125,11 @@ class JdAdapter:
     def _normalize(self, it):
         """把京粉精选字段规整成砍价侠统一商品结构（+ 证据链用的真实扩展字段）。"""
         price_info = it.get("priceInfo") or {}
-        price = _f(price_info.get("price"))
-        # 券后到手价：优先 lowestCouponPrice，其次 purchasePrice，都没有则等于标价
-        coupon_price = _f(price_info.get("lowestCouponPrice")) or _f(
+        price = read_price(price_info.get("price"))
+        # 只使用接口明确提供的到手价，保留缺失状态。
+        coupon_price = read_price(price_info.get("lowestCouponPrice")) or read_price(
             (it.get("purchasePriceInfo") or {}).get("purchasePrice")
-        ) or price
+        )
 
         # 优惠券明细（真实券面额 + 门槛）
         promotions = []
@@ -154,24 +151,25 @@ class JdAdapter:
         mat = it.get("materialUrl") or ""
         url = mat if mat.startswith("http") else ("https://" + mat if mat else "")
 
-        comm = _f((it.get("commissionInfo") or {}).get("commissionShare"))  # 百分比，如 45.0
+        comm = read_number((it.get("commissionInfo") or {}).get("commissionShare"))
         shop = it.get("shopInfo") or {}
         return {
-            "id": str(it.get("itemId") or it.get("spuid") or ""),
+            "id": str(it.get("skuId") or it.get("itemId") or it.get("spuid") or ""),
             "name": (it.get("skuName") or "").strip(),
             "platform": "京东",
             "price": price,
             "coupon_price": coupon_price,
             "commission_rate": comm,
-            "volume": int(it.get("inOrderCount30Days") or 0),  # 近30天订单量（市场验证度）
+            "volume": read_number(it.get("inOrderCount30Days")),
             "url": url,
             "pict_url": (pict or "").replace("http://", "https://"),
             "promotions": promotions,
             # ==== 证据链用的真实扩展字段（全部来自接口，无编造）====
             "coupon_discount": coupon_discount,
             "coupon_quota": coupon_quota,
-            "comments": int(it.get("comments") or 0),
-            "good_rate": _f(it.get("goodCommentsShare")),
+            "comments": read_number(it.get("comments")),
+            "good_rate": read_number(it.get("goodCommentsShare")),
+            "category_id": str((it.get("categoryInfo") or {}).get("cid3") or ""),
             "brand": it.get("brandName") or "",
             "shop": shop.get("shopName") or "",
             "shop_score": shop.get("userEvaluateScore") or "",
